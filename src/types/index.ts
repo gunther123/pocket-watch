@@ -8,6 +8,7 @@ export interface Bill {
   amount: number;
   nextDueDate: Date;
   frequency: BillFrequency;
+  isExistingRecurring?: boolean; // Added flag
 }
 
 export interface PayPeriodConfig {
@@ -15,6 +16,4 @@ export interface PayPeriodConfig {
   lastPayday: Date;
   payFrequency: PayFrequency;
 }
-    
-
     

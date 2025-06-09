@@ -15,8 +15,10 @@ import {
   startOfMonth,
   endOfMonth,
   isWithinInterval,
+  subWeeks,
+  subMonths,
 } from 'date-fns';
-import { CalendarIcon, Loader2, PlusCircle, Trash2, Wallet, Info, ChevronDown, ChevronUp } from 'lucide-react';
+import { CalendarIcon, Loader2, PlusCircle, Trash2, Wallet, Info, ChevronDown, ChevronUp, Pencil } from 'lucide-react';
 import Image from 'next/image';
 import React, { useEffect, useState } from 'react';
 import { useForm, type SubmitHandler } from 'react-hook-form';
@@ -26,7 +28,9 @@ import { Accordion, AccordionContent, AccordionItem, AccordionTrigger } from '@/
 import { Button } from '@/components/ui/button';
 import { Calendar } from '@/components/ui/calendar';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
-import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
+import { Checkbox } from '@/components/ui/checkbox';
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog';
+import { Form, FormControl, FormDescription, FormField, FormItem, FormLabel, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
@@ -41,6 +45,7 @@ const billSchema = z.object({
   amount: z.coerce.number().positive('Amount must be positive.').optional().default(0),
   nextDueDate: z.date({ required_error: 'Next due date is required.' }).optional(),
   frequency: z.enum(['one-time', 'weekly', 'bi-weekly', 'tri-weekly', 'monthly'], { required_error: 'Frequency is required.' }),
+  isExistingRecurring: z.boolean().optional().default(false),
 });
 
 const payPeriodSchema = z.object({
@@ -69,6 +74,10 @@ export default function PocketWatchApp() {
   const [isLoading, setIsLoading] = useState(true);
   const [showAllDueBills, setShowAllDueBills] = useState(false);
 
+  const [editingBill, setEditingBill] = useState<Bill | null>(null);
+  const [isBillFormDialogOpen, setIsBillFormDialogOpen] = useState(false);
+
+
   const billForm = useForm<BillFormData>({
     resolver: zodResolver(billSchema),
     defaultValues: {
@@ -76,6 +85,7 @@ export default function PocketWatchApp() {
       amount: 0,
       nextDueDate: undefined,
       frequency: 'monthly',
+      isExistingRecurring: false,
     },
   });
 
@@ -88,6 +98,8 @@ export default function PocketWatchApp() {
     },
   });
 
+  const selectedFrequency = billForm.watch('frequency');
+
   useEffect(() => {
     setIsLoading(true);
     try {
@@ -96,6 +108,9 @@ export default function PocketWatchApp() {
         const parsedBills: Bill[] = JSON.parse(storedBills).map((bill: any) => ({
           ...bill,
           nextDueDate: new Date(bill.nextDueDate),
+          isExistingRecurring: bill.frequency !== 'one-time' && bill.isExistingRecurring === undefined
+                               ? true
+                               : !!bill.isExistingRecurring,
         }));
         setBills(parsedBills);
       }
@@ -150,6 +165,16 @@ export default function PocketWatchApp() {
     }
   };
 
+  const calculatePreviousOccurrence = (currentDate: Date, frequency: BillFrequency): Date => {
+    switch (frequency) {
+      case 'weekly': return subWeeks(currentDate, 1);
+      case 'bi-weekly': return subWeeks(currentDate, 2);
+      case 'tri-weekly': return subWeeks(currentDate, 3);
+      case 'monthly': return subMonths(currentDate, 1);
+      default: return currentDate;
+    }
+  };
+
  useEffect(() => {
     if (!payPeriodConfig || !payPeriodConfig.lastPayday) {
       setLeftoverMoney(null);
@@ -160,13 +185,11 @@ export default function PocketWatchApp() {
     }
 
     const today = startOfDay(new Date());
-    const currentMonthStart = startOfMonth(today);
-    const currentMonthEnd = endOfMonth(today);
-
+    const currentMonthStart = startOfDay(startOfMonth(today));
+    const currentMonthEnd = startOfDay(endOfMonth(today));
 
     const { payAmount, lastPayday, payFrequency } = payPeriodConfig;
     let resolvedLastPayday = startOfDay(lastPayday);
-
 
     let periodStartDate = resolvedLastPayday;
     let periodEndDate: Date;
@@ -188,6 +211,12 @@ export default function PocketWatchApp() {
         break;
       case 'monthly':
         periodEndDate = startOfDay(addMonths(periodStartDate, 1));
+        periodStartDate = startOfDay(new Date(today.getFullYear(), today.getMonth(), resolvedLastPayday.getDate()));
+        if (isAfter(periodStartDate, today)) {
+            periodStartDate = subMonths(periodStartDate, 1);
+        }
+        periodEndDate = startOfDay(addMonths(periodStartDate, 1));
+
         while (isBefore(periodEndDate, today)) {
             periodStartDate = periodEndDate;
             periodEndDate = startOfDay(addMonths(periodStartDate, 1));
@@ -202,98 +231,151 @@ export default function PocketWatchApp() {
     const dueBillsInPeriod: Bill[] = [];
 
     bills.forEach(bill => {
-      let currentBillDueDate = startOfDay(bill.nextDueDate); // Start with the bill's anchor due date
+      const billAnchorDate = startOfDay(bill.nextDueDate);
 
-      // For recurring bills, advance to or past the period start date
-      if (bill.frequency !== 'one-time') {
-        while (isBefore(currentBillDueDate, periodStartDate)) {
-          const advancedDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
-          if (isEqual(advancedDate, currentBillDueDate)) { // Safety break
-            break;
+      if (bill.frequency === 'one-time') {
+        if (isWithinInterval(billAnchorDate, { start: periodStartDate, end: addDays(periodEndDate, -1) })) {
+          totalBillsInPayPeriod += bill.amount;
+          dueBillsInPeriod.push({ ...bill, nextDueDate: billAnchorDate });
+        }
+        return;
+      }
+
+      let currentProcessingDate = billAnchorDate;
+
+      if (bill.isExistingRecurring) {
+        if (isBefore(currentProcessingDate, periodStartDate)) {
+          while (isBefore(currentProcessingDate, periodStartDate)) {
+            const advancedDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+            if (isEqual(advancedDate, currentProcessingDate)) break;
+            currentProcessingDate = advancedDate;
           }
-          currentBillDueDate = advancedDate;
+        } else {
+          while (isAfter(currentProcessingDate, periodStartDate) || isEqual(currentProcessingDate, periodStartDate)) {
+            const prevDate = startOfDay(calculatePreviousOccurrence(currentProcessingDate, bill.frequency));
+            if (isBefore(prevDate, periodStartDate)) break;
+            if (isEqual(prevDate, currentProcessingDate)) break;
+            currentProcessingDate = prevDate;
+            if (isBefore(currentProcessingDate, new Date("1900-01-01"))) break;
+          }
+           if (isBefore(currentProcessingDate, periodStartDate)) {
+             currentProcessingDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+           }
+        }
+      } else {
+        if (isBefore(currentProcessingDate, periodStartDate)) {
+          while (isBefore(currentProcessingDate, periodStartDate)) {
+            const advancedDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+            if (isEqual(advancedDate, currentProcessingDate)) break;
+            currentProcessingDate = advancedDate;
+          }
         }
       }
 
-      // Collect all occurrences within the pay period
-      // For 'one-time', this loop will run at most once if the date matches.
-      // For recurring, it collects all due instances.
-      while (isBefore(currentBillDueDate, periodEndDate) || isEqual(currentBillDueDate, periodStartDate)) {
-        if (isWithinInterval(currentBillDueDate, { start: periodStartDate, end: addDays(periodEndDate, -1) })) {
-          totalBillsInPayPeriod += bill.amount;
-          dueBillsInPeriod.push({ ...bill, nextDueDate: currentBillDueDate }); // Store with the actual due date for this period
+      while (isBefore(currentProcessingDate, periodEndDate)) {
+        if (isWithinInterval(currentProcessingDate, { start: periodStartDate, end: addDays(periodEndDate,-1) })) {
+            totalBillsInPayPeriod += bill.amount;
+            dueBillsInPeriod.push({ ...bill, nextDueDate: currentProcessingDate });
         }
 
-        if (bill.frequency === 'one-time') break; // One-time bills don't repeat within the period
-
-        const nextCalculatedDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
-        if (isEqual(nextCalculatedDueDate, currentBillDueDate)) { // Safety break
-             break;
+        const nextCalculatedDueDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+        if (isEqual(nextCalculatedDueDate, currentProcessingDate)) {
+           console.warn(`Bill ${bill.name} frequency ${bill.frequency} did not advance date in pay period calc. Breaking loop.`);
+           break;
         }
-        currentBillDueDate = nextCalculatedDueDate;
+        currentProcessingDate = nextCalculatedDueDate;
       }
     });
+
     setBillsDueThisPayPeriod(dueBillsInPeriod.sort((a,b) => a.nextDueDate.getTime() - b.nextDueDate.getTime()));
     setLeftoverMoney(payAmount - totalBillsInPayPeriod);
 
-
     let calculatedMonthlyIncome = 0;
     if (payPeriodConfig.payFrequency === 'monthly') {
-        let paydayInMonth = startOfDay(new Date(currentMonthStart.getFullYear(), currentMonthStart.getMonth(), payPeriodConfig.lastPayday.getDate()));
-        while(isBefore(paydayInMonth, currentMonthStart)){
-            paydayInMonth = addMonths(paydayInMonth, 1);
+        calculatedMonthlyIncome = 0;
+        let tempPayDate = startOfDay(payPeriodConfig.lastPayday);
+        while(isAfter(tempPayDate, currentMonthStart)) {
+            tempPayDate = subMonths(tempPayDate,1);
         }
-        if (isWithinInterval(paydayInMonth, {start: currentMonthStart, end: currentMonthEnd})) {
-            calculatedMonthlyIncome = payPeriodConfig.payAmount;
+        while(isBefore(tempPayDate, currentMonthStart) || !isEqual(tempPayDate.getDate(), payPeriodConfig.lastPayday.getDate())) {
+            tempPayDate = addMonths(tempPayDate,1);
+            tempPayDate = startOfDay(new Date(tempPayDate.getFullYear(), tempPayDate.getMonth(), payPeriodConfig.lastPayday.getDate()));
+        }
+        if (isWithinInterval(tempPayDate, {start: currentMonthStart, end: currentMonthEnd})) {
+            calculatedMonthlyIncome += payPeriodConfig.payAmount;
         }
     } else {
+      calculatedMonthlyIncome = 0;
       let currentPayDate = startOfDay(payPeriodConfig.lastPayday);
       const payIntervalWeeks = payPeriodConfig.payFrequency === 'weekly' ? 1 : 2;
-
-      // Go back to find first potential payday before or at the start of the month
       while (isAfter(currentPayDate, currentMonthStart)) {
-        currentPayDate = addWeeks(currentPayDate, -payIntervalWeeks);
+        currentPayDate = subWeeks(currentPayDate, payIntervalWeeks);
       }
-      // Then advance to the first payday on or after the month start
        while (isBefore(currentPayDate, currentMonthStart)) {
         currentPayDate = addWeeks(currentPayDate, payIntervalWeeks);
       }
-
-      while (isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd}) || isEqual(currentPayDate, currentMonthStart) || isEqual(currentPayDate, currentMonthEnd)) {
-         if(isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd})) {
-            calculatedMonthlyIncome += payPeriodConfig.payAmount;
-         }
+      while (isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd})) {
+        calculatedMonthlyIncome += payPeriodConfig.payAmount;
         currentPayDate = addWeeks(currentPayDate, payIntervalWeeks);
-        if(isAfter(currentPayDate, currentMonthEnd) && !isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd})) break;
       }
     }
 
-
     let calculatedMonthlyBills = 0;
     bills.forEach(bill => {
-      let currentBillDueDate = startOfDay(bill.nextDueDate);
+      const billAnchorDate = startOfDay(bill.nextDueDate);
 
-      if (bill.frequency !== 'one-time') {
-          while (isBefore(currentBillDueDate, currentMonthStart)) {
-            const advancedDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
-            if (isEqual(advancedDate, currentBillDueDate)) break;
-            currentBillDueDate = advancedDate;
-          }
+      if (bill.frequency === 'one-time') {
+        if (isWithinInterval(billAnchorDate, { start: currentMonthStart, end: currentMonthEnd })) {
+          calculatedMonthlyBills += bill.amount;
+        }
+        return;
       }
 
-      while (!isAfter(currentBillDueDate, currentMonthEnd)) {
-         if (isWithinInterval(currentBillDueDate, {start: currentMonthStart, end: currentMonthEnd})) {
+      let currentProcessingDate = billAnchorDate;
+
+      if (bill.isExistingRecurring) {
+        if (isBefore(currentProcessingDate, currentMonthStart)) {
+          while (isBefore(currentProcessingDate, currentMonthStart)) {
+            const advancedDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+            if (isEqual(advancedDate, currentProcessingDate)) break;
+            currentProcessingDate = advancedDate;
+          }
+        } else {
+          while (isAfter(currentProcessingDate, currentMonthStart) || isEqual(currentProcessingDate, currentMonthStart)) {
+            const prevDate = startOfDay(calculatePreviousOccurrence(currentProcessingDate, bill.frequency));
+            if (isBefore(prevDate, currentMonthStart)) break;
+            if (isEqual(prevDate, currentProcessingDate)) break;
+            currentProcessingDate = prevDate;
+             if (isBefore(currentProcessingDate, new Date("1900-01-01"))) break;
+          }
+           if (isBefore(currentProcessingDate, currentMonthStart)) {
+             currentProcessingDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+           }
+        }
+      } else {
+        if (isBefore(currentProcessingDate, currentMonthStart)) {
+          while (isBefore(currentProcessingDate, currentMonthStart)) {
+            const advancedDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+            if (isEqual(advancedDate, currentProcessingDate)) break;
+            currentProcessingDate = advancedDate;
+          }
+        }
+      }
+
+      while (!isAfter(currentProcessingDate, currentMonthEnd)) {
+         if (isWithinInterval(currentProcessingDate, {start: currentMonthStart, end: currentMonthEnd})) {
            calculatedMonthlyBills += bill.amount;
          }
-         if (bill.frequency === 'one-time') break;
 
-         const nextCalculatedDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
-         if (isEqual(nextCalculatedDueDate, currentBillDueDate)) {
+         const nextCalculatedDueDate = startOfDay(calculateNextOccurrence(currentProcessingDate, bill.frequency));
+         if (bill.frequency !== 'one-time' && isEqual(nextCalculatedDueDate, currentProcessingDate)) {
+             console.warn(`Bill ${bill.name} frequency ${bill.frequency} did not advance date in monthly summary. Breaking loop.`);
              break;
          }
-         currentBillDueDate = nextCalculatedDueDate;
+         currentProcessingDate = nextCalculatedDueDate;
       }
     });
+
     setMonthlySummary({
       income: calculatedMonthlyIncome,
       bills: calculatedMonthlyBills,
@@ -302,22 +384,92 @@ export default function PocketWatchApp() {
 
   }, [bills, payPeriodConfig]);
 
-  const handleAddBill: SubmitHandler<BillFormData> = async (data) => {
+  const handleOpenAddBillDialog = () => {
+    setEditingBill(null);
+    billForm.reset({
+      name: '',
+      amount: 0,
+      nextDueDate: undefined,
+      frequency: 'monthly',
+      isExistingRecurring: false,
+    });
+    setIsBillFormDialogOpen(true);
+  };
+
+  const handleOpenEditBillDialog = (bill: Bill) => {
+    setEditingBill(bill);
+    billForm.reset({
+      name: bill.name,
+      amount: bill.amount,
+      nextDueDate: bill.nextDueDate,
+      frequency: bill.frequency,
+      isExistingRecurring: bill.frequency === 'one-time' ? false : !!bill.isExistingRecurring,
+    });
+    setIsBillFormDialogOpen(true);
+  };
+
+  const saveBillData = (data: BillFormData): boolean => {
     if (!data.nextDueDate) {
         toast({ title: "Error", description: "Next due date is required.", variant: "destructive" });
-        return;
+        return false;
     }
-    const newBill: Bill = {
-      id: Date.now().toString(),
-      name: data.name,
-      amount: Number(data.amount) || 0,
-      nextDueDate: startOfDay(data.nextDueDate), // Store original due date
-      frequency: data.frequency,
-    };
-    setBills(prev => [...prev, newBill].sort((a,b) => a.nextDueDate.getTime() - b.nextDueDate.getTime()));
-    toast({ title: "Bill Added", description: `${data.name} has been added.` });
-    billForm.reset({ name: '', amount: 0, nextDueDate: undefined, frequency: 'monthly' });
+
+    if (editingBill) {
+      const updatedBill: Bill = {
+        ...editingBill,
+        name: data.name,
+        amount: Number(data.amount) || 0,
+        nextDueDate: startOfDay(data.nextDueDate),
+        frequency: data.frequency,
+        isExistingRecurring: data.frequency === 'one-time' ? false : data.isExistingRecurring,
+      };
+      setBills(prevBills =>
+        prevBills.map(b => b.id === editingBill.id ? updatedBill : b)
+                 .sort((a, b) => getActualNextDueDate(a, new Date()).getTime() - getActualNextDueDate(b, new Date()).getTime())
+      );
+      toast({ title: "Bill Updated", description: `${updatedBill.name} has been updated.` });
+    } else {
+      const newBill: Bill = {
+        id: Date.now().toString(),
+        name: data.name,
+        amount: Number(data.amount) || 0,
+        nextDueDate: startOfDay(data.nextDueDate),
+        frequency: data.frequency,
+        isExistingRecurring: data.frequency === 'one-time' ? false : data.isExistingRecurring,
+      };
+      setBills(prevBills =>
+        [...prevBills, newBill]
+          .sort((a, b) => getActualNextDueDate(a, new Date()).getTime() - getActualNextDueDate(b, new Date()).getTime())
+      );
+      toast({ title: "Bill Added", description: `${newBill.name} has been added.` });
+    }
+    return true;
   };
+
+  const handleSaveAndCloseDialog = async () => {
+    billForm.handleSubmit((data) => {
+      if (saveBillData(data)) {
+        setIsBillFormDialogOpen(false);
+        setEditingBill(null); // Also reset editingBill when closing
+      }
+    })();
+  };
+
+  const handleSaveAndAddAnother = async () => {
+    billForm.handleSubmit((data) => {
+      if (saveBillData(data)) {
+        // Reset form for new entry, keep dialog open
+        billForm.reset({
+          name: '',
+          amount: 0,
+          nextDueDate: undefined,
+          frequency: 'monthly',
+          isExistingRecurring: false,
+        });
+      }
+    })();
+  };
+
 
   const handleDeleteBill = async (id: string) => {
     setBills(prev => prev.filter(bill => bill.id !== id));
@@ -358,22 +510,46 @@ export default function PocketWatchApp() {
     }
   };
 
-  const getActualNextDueDate = (bill: Bill, today: Date): Date => {
+  const getActualNextDueDate = (bill: Bill, todayDate: Date): Date => {
     if (bill.frequency === 'one-time') {
-      return bill.nextDueDate; // Return the stored due date for one-time bills
+      return bill.nextDueDate;
     }
 
-    let actualNextDueDate = startOfDay(bill.nextDueDate); // Start with the bill's anchor/original due date
-    const todayStart = startOfDay(today);
+    let actualNextDueDate = startOfDay(bill.nextDueDate);
+    const todayStart = startOfDay(todayDate);
 
-    // Advance the date until it's on or after today
-    while (isBefore(actualNextDueDate, todayStart)) {
-      const advancedDate = startOfDay(calculateNextOccurrence(actualNextDueDate, bill.frequency));
-      // Safety break if date doesn't advance (e.g., misconfigured or unexpected issue)
-      if (isEqual(advancedDate, actualNextDueDate)) {
-          break;
-      }
-      actualNextDueDate = advancedDate;
+    if (bill.isExistingRecurring) {
+        if (isBefore(actualNextDueDate, todayStart)) {
+            while(isBefore(actualNextDueDate, todayStart)) {
+                const advancedDate = startOfDay(calculateNextOccurrence(actualNextDueDate, bill.frequency));
+                if (isEqual(advancedDate, actualNextDueDate)) break;
+                actualNextDueDate = advancedDate;
+            }
+        } else {
+            while(true) {
+                const prevDate = startOfDay(calculatePreviousOccurrence(actualNextDueDate, bill.frequency));
+                if(isBefore(prevDate, todayStart) && !isEqual(prevDate,todayStart) && !isEqual(actualNextDueDate, todayStart)) {
+                     if (isBefore(actualNextDueDate, todayStart)) {
+                         actualNextDueDate = startOfDay(calculateNextOccurrence(prevDate, bill.frequency));
+                     }
+                     break;
+                }
+                if(isEqual(prevDate, actualNextDueDate)) break;
+                actualNextDueDate = prevDate;
+                if (isBefore(actualNextDueDate, new Date("1900-01-01"))) break;
+            }
+             if (isBefore(actualNextDueDate, todayStart)) {
+                 actualNextDueDate = startOfDay(calculateNextOccurrence(actualNextDueDate, bill.frequency));
+             }
+        }
+    } else {
+        while (isBefore(actualNextDueDate, todayStart)) {
+          const advancedDate = startOfDay(calculateNextOccurrence(actualNextDueDate, bill.frequency));
+          if (isEqual(advancedDate, actualNextDueDate)) {
+              break;
+          }
+          actualNextDueDate = advancedDate;
+        }
     }
     return actualNextDueDate;
   };
@@ -420,7 +596,7 @@ export default function PocketWatchApp() {
       {payPeriodConfig && billsDueThisPayPeriod.length > 0 && currentPayPeriodDates && (
         <Card>
           <CardHeader>
-            <CardTitle className="font-headline">Bills Due This Pay Period</CardTitle>
+            <CardTitle className="font-headline mb-2">Bills Due This Pay Period</CardTitle>
             <CardDescription>
               These bills are scheduled between {format(currentPayPeriodDates.start, 'MMM d')} and {format(addDays(currentPayPeriodDates.end, -1), 'MMM d, yyyy')}.
             </CardDescription>
@@ -437,7 +613,7 @@ export default function PocketWatchApp() {
                 </TableHeader>
                 <TableBody>
                   {displayedBillsDueInPayPeriod.map(bill => (
-                    <TableRow key={bill.id + bill.nextDueDate.toISOString()}>
+                    <TableRow key={bill.id + bill.nextDueDate.toISOString() + Math.random()}>
                       <TableCell className="font-medium">{bill.name}</TableCell>
                       <TableCell>{format(bill.nextDueDate, 'MMM d, yyyy')}</TableCell>
                       <TableCell className="text-right">
@@ -462,20 +638,10 @@ export default function PocketWatchApp() {
         </Card>
       )}
 
-       {!payPeriodConfig && !isLoading && (
-        <Alert>
-          <Info className="h-4 w-4" />
-          <AlertTitle>Setup Required!</AlertTitle>
-          <AlertDescription>
-            Please set up your pay period below to calculate your leftover money and see upcoming bills for your pay cycle.
-          </AlertDescription>
-        </Alert>
-      )}
-
       {monthlySummary && payPeriodConfig && (
         <Card>
           <CardHeader>
-            <CardTitle className="font-headline">Current Month Summary</CardTitle>
+            <CardTitle className="font-headline mb-2">Current Month Summary</CardTitle>
             <CardDescription>
               Estimated income and bills for {format(new Date(), 'MMMM yyyy')}. This is a calendar month overview.
             </CardDescription>
@@ -504,173 +670,104 @@ export default function PocketWatchApp() {
         </Card>
       )}
 
+       {!payPeriodConfig && !isLoading && (
+        <Alert>
+          <Info className="h-4 w-4" />
+          <AlertTitle>Setup Required!</AlertTitle>
+          <AlertDescription>
+            Please set up your pay period below to calculate your leftover money and see upcoming bills for your pay cycle.
+          </AlertDescription>
+        </Alert>
+      )}
+
       <Accordion type="single" collapsible className="w-full">
-        <AccordionItem value="payPeriodConfigAccordionItem" className="border-b-0">
-          <Card>
-           <AccordionTrigger className="w-full px-6 text-left hover:no-underline">
-              <CardHeader className="flex-1 p-0">
-                <CardTitle className="font-headline">Pay Period Configuration</CardTitle>
-                <CardDescription>Enter your pay amount, last payday, and how often you get paid.</CardDescription>
-              </CardHeader>
-            </AccordionTrigger>
-            <AccordionContent>
-              <CardContent>
-                <Form {...payPeriodForm}>
-                  <form onSubmit={payPeriodForm.handleSubmit(handleSetPayPeriod)} className="space-y-6">
-                    <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                      <FormField
-                        control={payPeriodForm.control}
-                        name="payAmount"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Pay Amount ($)</FormLabel>
-                            <FormControl><Input type="number" placeholder="e.g., 2000" {...field} value={field.value === null || field.value === undefined || field.value === 0 ? '' : field.value} onChange={e => field.onChange(parseFloat(e.target.value) || 0)} /></FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={payPeriodForm.control}
-                        name="lastPayday"
-                        render={({ field }) => (
-                          <FormItem className="flex flex-col">
-                            <FormLabel>Last Payday</FormLabel>
-                            <Popover>
-                              <PopoverTrigger asChild>
-                                <FormControl>
-                                  <Button variant="outline" className={cn("w-full pl-3 text-left font-normal", !field.value && "text-muted-foreground")}>
-                                    {field.value ? format(field.value, 'PPP') : <span>Pick a date</span>}
-                                    <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
-                                  </Button>
-                                </FormControl>
-                              </PopoverTrigger>
-                              <PopoverContent className="w-auto p-0" align="start">
-                                <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={(date) => date > new Date() || date < new Date("1900-01-01")} />
-                              </PopoverContent>
-                            </Popover>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={payPeriodForm.control}
-                        name="payFrequency"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Pay Frequency</FormLabel>
-                            <Select onValueChange={field.onChange} value={field.value} defaultValue={field.value}>
-                              <FormControl><SelectTrigger><SelectValue placeholder="Select frequency" /></SelectTrigger></FormControl>
-                              <SelectContent>
-                                <SelectItem value="weekly">Weekly</SelectItem>
-                                <SelectItem value="bi-weekly">Bi-Weekly</SelectItem>
-                                <SelectItem value="monthly">Monthly</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                    <Button type="submit" className="w-full md:w-auto">Save Pay Period</Button>
-                  </form>
-                </Form>
-              </CardContent>
-            </AccordionContent>
-          </Card>
+         <AccordionItem value="payPeriodConfigAccordionItem" className="border-b-0">
+            <Card>
+                <AccordionTrigger className="w-full px-6 text-left hover:no-underline">
+                    <CardHeader className="flex-1 p-0">
+                        <CardTitle className="font-headline mb-2">Pay Period Configuration</CardTitle>
+                        <CardDescription>Enter your pay amount, last payday, and how often you get paid.</CardDescription>
+                    </CardHeader>
+                </AccordionTrigger>
+                <AccordionContent>
+                    <CardContent>
+                        <Form {...payPeriodForm}>
+                        <form onSubmit={payPeriodForm.handleSubmit(handleSetPayPeriod)} className="space-y-6">
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                            <FormField
+                                control={payPeriodForm.control}
+                                name="payAmount"
+                                render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel>Pay Amount ($)</FormLabel>
+                                    <FormControl><Input type="number" placeholder="e.g., 2000" {...field} value={field.value === null || field.value === undefined || field.value === 0 ? '' : field.value} onChange={e => field.onChange(parseFloat(e.target.value) || 0)} /></FormControl>
+                                    <FormMessage />
+                                </FormItem>
+                                )}
+                            />
+                            <FormField
+                                control={payPeriodForm.control}
+                                name="lastPayday"
+                                render={({ field }) => (
+                                <FormItem className="flex flex-col">
+                                    <FormLabel>Last Payday</FormLabel>
+                                    <Popover>
+                                    <PopoverTrigger asChild>
+                                        <FormControl>
+                                        <Button variant="outline" className={cn("w-full pl-3 text-left font-normal", !field.value && "text-muted-foreground")}>
+                                            {field.value ? format(field.value, 'PPP') : <span>Pick a date</span>}
+                                            <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
+                                        </Button>
+                                        </FormControl>
+                                    </PopoverTrigger>
+                                    <PopoverContent className="w-auto p-0" align="start">
+                                        <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={(date) => date > new Date() || date < new Date("1900-01-01")} />
+                                    </PopoverContent>
+                                    </Popover>
+                                    <FormMessage />
+                                </FormItem>
+                                )}
+                            />
+                            <FormField
+                                control={payPeriodForm.control}
+                                name="payFrequency"
+                                render={({ field }) => (
+                                <FormItem>
+                                    <FormLabel>Pay Frequency</FormLabel>
+                                    <Select onValueChange={field.onChange} value={field.value} defaultValue={field.value}>
+                                    <FormControl><SelectTrigger><SelectValue placeholder="Select frequency" /></SelectTrigger></FormControl>
+                                    <SelectContent>
+                                        <SelectItem value="weekly">Weekly</SelectItem>
+                                        <SelectItem value="bi-weekly">Bi-Weekly</SelectItem>
+                                        <SelectItem value="monthly">Monthly</SelectItem>
+                                    </SelectContent>
+                                    </Select>
+                                    <FormMessage />
+                                </FormItem>
+                                )}
+                            />
+                            </div>
+                            <Button type="submit" className="w-full md:w-auto">Save Pay Period</Button>
+                        </form>
+                        </Form>
+                    </CardContent>
+                </AccordionContent>
+            </Card>
         </AccordionItem>
       </Accordion>
 
       <Card>
-        <CardHeader>
-          <CardTitle className="font-headline">Manage Bills</CardTitle>
-          <CardDescription>Add your recurring or one-time bills here. Bills are sorted by their actual next due date.</CardDescription>
+        <CardHeader className="flex flex-row justify-between items-center">
+            <div>
+                <CardTitle className="font-headline mb-2">Manage Bills</CardTitle>
+                <CardDescription>Add, edit, or remove your bills. Bills are sorted by their actual next due date.</CardDescription>
+            </div>
+            <Button onClick={handleOpenAddBillDialog}><PlusCircle className="mr-2 h-4 w-4" /> Add New Bill</Button>
         </CardHeader>
         <CardContent className="space-y-6">
-          <Accordion type="single" collapsible className="w-full">
-            <AccordionItem value="add-bill-form-accordion" className="border rounded-lg shadow-sm">
-              <AccordionTrigger className="w-full flex justify-between items-center px-6 py-4 hover:no-underline rounded-t-lg data-[state=closed]:rounded-b-lg">
-                <h3 className="text-lg font-medium text-left">Add New Bill</h3>
-              </AccordionTrigger>
-              <AccordionContent className="px-6 pb-6 pt-2">
-                <Form {...billForm}>
-                  <form onSubmit={billForm.handleSubmit(handleAddBill)} className="space-y-6">
-                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-                      <FormField
-                        control={billForm.control}
-                        name="name"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Bill Name</FormLabel>
-                            <FormControl><Input placeholder="e.g., Rent, Netflix" {...field} /></FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={billForm.control}
-                        name="amount"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Amount ($)</FormLabel>
-                            <FormControl><Input type="number" placeholder="e.g., 100" {...field} value={field.value === null || field.value === undefined || field.value === 0 ? '' : field.value}  onChange={e => field.onChange(parseFloat(e.target.value) || 0)} /></FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={billForm.control}
-                        name="nextDueDate"
-                        render={({ field }) => (
-                          <FormItem className="flex flex-col">
-                            <FormLabel>Next Due Date / Start Date</FormLabel>
-                             <Popover>
-                              <PopoverTrigger asChild>
-                                <FormControl>
-                                  <Button variant="outline" className={cn("w-full pl-3 text-left font-normal", !field.value && "text-muted-foreground")}>
-                                    {field.value ? format(field.value, 'PPP') : <span>Pick a date</span>}
-                                    <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
-                                  </Button>
-                                </FormControl>
-                              </PopoverTrigger>
-                              <PopoverContent className="w-auto p-0" align="start">
-                                <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={(date) => date < startOfDay(new Date("1900-01-01"))} />
-                              </PopoverContent>
-                            </Popover>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={billForm.control}
-                        name="frequency"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Frequency</FormLabel>
-                            <Select onValueChange={field.onChange} value={field.value} defaultValue={field.value}>
-                              <FormControl><SelectTrigger><SelectValue placeholder="Select frequency" /></SelectTrigger></FormControl>
-                              <SelectContent>
-                                <SelectItem value="one-time">One-Time</SelectItem>
-                                <SelectItem value="weekly">Weekly</SelectItem>
-                                <SelectItem value="bi-weekly">Bi-Weekly</SelectItem>
-                                <SelectItem value="tri-weekly">Every 3 Weeks</SelectItem>
-                                <SelectItem value="monthly">Monthly</SelectItem>
-                              </SelectContent>
-                            </Select>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                    <Button type="submit" className="w-full md:w-auto"><PlusCircle className="mr-2 h-4 w-4" /> Add Bill</Button>
-                  </form>
-                </Form>
-              </AccordionContent>
-            </AccordionItem>
-          </Accordion>
-
           {billsForDisplayInTable.length > 0 ? (
-            <div className="mt-6">
-              <h3 className="text-lg font-medium mb-2">Your Bills</h3>
+            <div className="mt-0">
+              <h3 className="text-lg font-medium mb-2 sr-only">Your Bills List</h3>
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -688,7 +785,10 @@ export default function PocketWatchApp() {
                       <TableCell>{new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(bill.amount)}</TableCell>
                       <TableCell>{format(bill.actualDisplayDueDate, 'MMM d, yyyy')}</TableCell>
                       <TableCell>{formatFrequency(bill.frequency)}</TableCell>
-                      <TableCell className="text-right">
+                      <TableCell className="text-right space-x-1">
+                        <Button variant="ghost" size="icon" onClick={() => handleOpenEditBillDialog(bill)} aria-label="Edit bill">
+                          <Pencil className="h-4 w-4" />
+                        </Button>
                         <Button variant="ghost" size="icon" onClick={() => handleDeleteBill(bill.id)} aria-label="Delete bill">
                           <Trash2 className="h-4 w-4 text-destructive" />
                         </Button>
@@ -701,11 +801,143 @@ export default function PocketWatchApp() {
           ) : (
             <div className="text-center text-muted-foreground mt-6 py-8 border-2 border-dashed rounded-lg" data-ai-hint="empty state illustration">
               <Image src="https://placehold.co/300x200.png" alt="No bills" width={300} height={200} className="mx-auto mb-4 rounded" data-ai-hint="piggy bank savings" />
-              <p>No bills added yet. Add your first bill using the form above!</p>
+              <p>No bills added yet. Click "Add New Bill" to get started!</p>
             </div>
           )}
         </CardContent>
       </Card>
+
+      <Dialog open={isBillFormDialogOpen} onOpenChange={(isOpen) => {
+          setIsBillFormDialogOpen(isOpen);
+          if (!isOpen) {
+              setEditingBill(null);
+              billForm.reset({
+                  name: '',
+                  amount: 0,
+                  nextDueDate: undefined,
+                  frequency: 'monthly',
+                  isExistingRecurring: false,
+              });
+          }
+      }}>
+        <DialogContent className="sm:max-w-[625px]">
+          <DialogHeader>
+            <DialogTitle>{editingBill ? 'Edit Bill' : 'Add New Bill'}</DialogTitle>
+            <DialogDescription>
+              {editingBill ? 'Update the details of your bill.' : 'Enter the details for your new bill.'}
+            </DialogDescription>
+          </DialogHeader>
+          <Form {...billForm}>
+            <form className="space-y-6 py-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 items-start">
+                    <FormField
+                    control={billForm.control}
+                    name="name"
+                    render={({ field }) => (
+                        <FormItem className="lg:col-span-2">
+                        <FormLabel>Bill Name</FormLabel>
+                        <FormControl><Input placeholder="e.g., Rent, Netflix" {...field} /></FormControl>
+                        <FormMessage />
+                        </FormItem>
+                    )}
+                    />
+                    <FormField
+                    control={billForm.control}
+                    name="amount"
+                    render={({ field }) => (
+                        <FormItem>
+                        <FormLabel>Amount ($)</FormLabel>
+                        <FormControl><Input type="number" placeholder="e.g., 100" {...field} value={field.value === null || field.value === undefined || field.value === 0 ? '' : field.value}  onChange={e => field.onChange(parseFloat(e.target.value) || 0)} /></FormControl>
+                        <FormMessage />
+                        </FormItem>
+                    )}
+                    />
+                    <FormField
+                    control={billForm.control}
+                    name="nextDueDate"
+                    render={({ field }) => (
+                        <FormItem className="flex flex-col">
+                        <FormLabel>Next Due Date / Start Date</FormLabel>
+                            <Popover>
+                            <PopoverTrigger asChild>
+                                <FormControl>
+                                <Button variant="outline" className={cn("w-full pl-3 text-left font-normal", !field.value && "text-muted-foreground")}>
+                                    {field.value ? format(field.value, 'PPP') : <span>Pick a date</span>}
+                                    <CalendarIcon className="ml-auto h-4 w-4 opacity-50" />
+                                </Button>
+                                </FormControl>
+                            </PopoverTrigger>
+                            <PopoverContent className="w-auto p-0" align="start">
+                                <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={(date) => date < startOfDay(new Date("1900-01-01"))} />
+                            </PopoverContent>
+                            </Popover>
+                        <FormMessage />
+                        </FormItem>
+                    )}
+                    />
+                    <FormField
+                    control={billForm.control}
+                    name="frequency"
+                    render={({ field }) => (
+                        <FormItem className="lg:col-span-2">
+                        <FormLabel>Frequency</FormLabel>
+                        <Select onValueChange={field.onChange} value={field.value} defaultValue={field.value}>
+                            <FormControl><SelectTrigger><SelectValue placeholder="Select frequency" /></SelectTrigger></FormControl>
+                            <SelectContent>
+                            <SelectItem value="one-time">One-Time</SelectItem>
+                            <SelectItem value="weekly">Weekly</SelectItem>
+                            <SelectItem value="bi-weekly">Bi-Weekly</SelectItem>
+                            <SelectItem value="tri-weekly">Every 3 Weeks</SelectItem>
+                            <SelectItem value="monthly">Monthly</SelectItem>
+                            </SelectContent>
+                        </Select>
+                        <FormMessage />
+                        </FormItem>
+                    )}
+                    />
+                    {selectedFrequency !== 'one-time' && (
+                    <FormField
+                        control={billForm.control}
+                        name="isExistingRecurring"
+                        render={({ field }) => (
+                        <FormItem className="flex flex-row items-start space-x-3 space-y-0 rounded-md border p-4 shadow lg:col-span-2">
+                            <FormControl>
+                            <Checkbox
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                            />
+                            </FormControl>
+                            <div className="space-y-1 leading-none">
+                            <FormLabel>
+                                Existing Recurring Bill?
+                            </FormLabel>
+                            <FormDescription>
+                                Check if this bill has been paid before the 'Next Due Date / Start Date' entered. If unchecked, it's treated as a new bill starting on that date.
+                            </FormDescription>
+                            </div>
+                        </FormItem>
+                        )}
+                    />
+                    )}
+                </div>
+                <DialogFooter>
+                <Button type="button" variant="outline" onClick={() => setIsBillFormDialogOpen(false)}>
+                    Cancel
+                </Button>
+                {!editingBill && (
+                    <Button type="button" onClick={handleSaveAndAddAnother}>
+                        <PlusCircle className="mr-2 h-4 w-4" /> Save and Add Another
+                    </Button>
+                )}
+                <Button type="button" onClick={handleSaveAndCloseDialog}>
+                    {editingBill ? 'Save Changes' : 'Save and Close'}
+                </Button>
+                </DialogFooter>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
+
 
        <footer className="text-center text-sm text-muted-foreground mt-12 py-4 border-t">
         <p>&copy; {new Date().getFullYear()} Pocket Watch. Keep your finances in check.</p>
