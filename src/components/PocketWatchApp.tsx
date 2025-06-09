@@ -95,7 +95,7 @@ export default function PocketWatchApp() {
       if (storedBills) {
         const parsedBills: Bill[] = JSON.parse(storedBills).map((bill: any) => ({
           ...bill,
-          nextDueDate: new Date(bill.nextDueDate), 
+          nextDueDate: new Date(bill.nextDueDate),
         }));
         setBills(parsedBills);
       }
@@ -108,13 +108,13 @@ export default function PocketWatchApp() {
           lastPayday: parsedConfig.lastPayday ? new Date(parsedConfig.lastPayday) : new Date(),
         };
         setPayPeriodConfig(configWithDate);
-        payPeriodForm.reset({ 
+        payPeriodForm.reset({
           payAmount: configWithDate.payAmount,
           lastPayday: configWithDate.lastPayday,
           payFrequency: configWithDate.payFrequency,
         });
       } else {
-         payPeriodForm.reset({ 
+         payPeriodForm.reset({
            payAmount: 0,
            lastPayday: undefined,
            payFrequency: 'bi-weekly',
@@ -125,7 +125,7 @@ export default function PocketWatchApp() {
       toast({ title: "Error", description: "Could not load saved data.", variant: "destructive" });
     }
     setIsLoading(false);
-  }, [toast, payPeriodForm]); 
+  }, [toast, payPeriodForm]);
 
   useEffect(() => {
     if (!isLoading) {
@@ -146,7 +146,7 @@ export default function PocketWatchApp() {
       case 'bi-weekly': return addWeeks(currentDate, 2);
       case 'tri-weekly': return addWeeks(currentDate, 3);
       case 'monthly': return addMonths(currentDate, 1);
-      default: return currentDate; 
+      default: return currentDate;
     }
   };
 
@@ -159,35 +159,35 @@ export default function PocketWatchApp() {
       return;
     }
 
-    const today = new Date();
+    const today = startOfDay(new Date());
     const currentMonthStart = startOfMonth(today);
     const currentMonthEnd = endOfMonth(today);
 
-    
-    const { payAmount, lastPayday, payFrequency } = payPeriodConfig;
-    let resolvedLastPayday = startOfDay(lastPayday); 
 
-    
+    const { payAmount, lastPayday, payFrequency } = payPeriodConfig;
+    let resolvedLastPayday = startOfDay(lastPayday);
+
+
     let periodStartDate = resolvedLastPayday;
     let periodEndDate: Date;
 
     switch (payFrequency) {
-      case 'weekly': 
-        periodEndDate = startOfDay(addWeeks(periodStartDate, 1)); 
+      case 'weekly':
+        periodEndDate = startOfDay(addWeeks(periodStartDate, 1));
         while (isBefore(periodEndDate, today)) {
             periodStartDate = periodEndDate;
             periodEndDate = startOfDay(addWeeks(periodStartDate, 1));
         }
         break;
-      case 'bi-weekly': 
-        periodEndDate = startOfDay(addWeeks(periodStartDate, 2)); 
+      case 'bi-weekly':
+        periodEndDate = startOfDay(addWeeks(periodStartDate, 2));
         while (isBefore(periodEndDate, today)) {
             periodStartDate = periodEndDate;
             periodEndDate = startOfDay(addWeeks(periodStartDate, 2));
         }
         break;
-      case 'monthly': 
-        periodEndDate = startOfDay(addMonths(periodStartDate, 1)); 
+      case 'monthly':
+        periodEndDate = startOfDay(addMonths(periodStartDate, 1));
         while (isBefore(periodEndDate, today)) {
             periodStartDate = periodEndDate;
             periodEndDate = startOfDay(addMonths(periodStartDate, 1));
@@ -195,95 +195,103 @@ export default function PocketWatchApp() {
         break;
       default: return;
     }
-    
+
     setCurrentPayPeriodDates({ start: periodStartDate, end: periodEndDate });
 
     let totalBillsInPayPeriod = 0;
     const dueBillsInPeriod: Bill[] = [];
 
     bills.forEach(bill => {
-      let effectiveDueDate = startOfDay(bill.nextDueDate);
-      if (bill.frequency === 'one-time') {
-        if (isWithinInterval(effectiveDueDate, { start: periodStartDate, end: addDays(periodEndDate, -1) })) {
-          totalBillsInPayPeriod += bill.amount;
-          dueBillsInPeriod.push(bill);
-        }
-      } else {
-        let currentBillDueDate = startOfDay(bill.nextDueDate);
-        
+      let currentBillDueDate = startOfDay(bill.nextDueDate); // Start with the bill's anchor due date
+
+      // For recurring bills, advance to or past the period start date
+      if (bill.frequency !== 'one-time') {
         while (isBefore(currentBillDueDate, periodStartDate)) {
-          currentBillDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
+          const advancedDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
+          if (isEqual(advancedDate, currentBillDueDate)) { // Safety break
+            break;
+          }
+          currentBillDueDate = advancedDate;
         }
-        
+      }
+
+      // Collect all occurrences within the pay period
+      // For 'one-time', this loop will run at most once if the date matches.
+      // For recurring, it collects all due instances.
+      while (isBefore(currentBillDueDate, periodEndDate) || isEqual(currentBillDueDate, periodStartDate)) {
         if (isWithinInterval(currentBillDueDate, { start: periodStartDate, end: addDays(periodEndDate, -1) })) {
           totalBillsInPayPeriod += bill.amount;
-          
-          dueBillsInPeriod.push({...bill, nextDueDate: currentBillDueDate });
+          dueBillsInPeriod.push({ ...bill, nextDueDate: currentBillDueDate }); // Store with the actual due date for this period
         }
+
+        if (bill.frequency === 'one-time') break; // One-time bills don't repeat within the period
+
+        const nextCalculatedDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
+        if (isEqual(nextCalculatedDueDate, currentBillDueDate)) { // Safety break
+             break;
+        }
+        currentBillDueDate = nextCalculatedDueDate;
       }
     });
     setBillsDueThisPayPeriod(dueBillsInPeriod.sort((a,b) => a.nextDueDate.getTime() - b.nextDueDate.getTime()));
     setLeftoverMoney(payAmount - totalBillsInPayPeriod);
 
-    
+
     let calculatedMonthlyIncome = 0;
     if (payPeriodConfig.payFrequency === 'monthly') {
-        
-        const paydayThisMonth = startOfDay(new Date(currentMonthStart.getFullYear(), currentMonthStart.getMonth(), payPeriodConfig.lastPayday.getDate()));
-        if (isWithinInterval(paydayThisMonth, {start: currentMonthStart, end: currentMonthEnd}) || isEqual(paydayThisMonth, currentMonthStart) || isEqual(paydayThisMonth, currentMonthEnd)) {
-            calculatedMonthlyIncome = payPeriodConfig.payAmount;
-        } else if (isBefore(paydayThisMonth, currentMonthStart)) { 
-             let tempPayDate = paydayThisMonth;
-             while(isBefore(tempPayDate, currentMonthStart)) {
-                tempPayDate = addMonths(tempPayDate, 1);
-             }
-             if (isWithinInterval(tempPayDate, {start: currentMonthStart, end: currentMonthEnd})) {
-                calculatedMonthlyIncome = payPeriodConfig.payAmount;
-             }
+        let paydayInMonth = startOfDay(new Date(currentMonthStart.getFullYear(), currentMonthStart.getMonth(), payPeriodConfig.lastPayday.getDate()));
+        while(isBefore(paydayInMonth, currentMonthStart)){
+            paydayInMonth = addMonths(paydayInMonth, 1);
         }
-    } else { 
+        if (isWithinInterval(paydayInMonth, {start: currentMonthStart, end: currentMonthEnd})) {
+            calculatedMonthlyIncome = payPeriodConfig.payAmount;
+        }
+    } else {
       let currentPayDate = startOfDay(payPeriodConfig.lastPayday);
       const payIntervalWeeks = payPeriodConfig.payFrequency === 'weekly' ? 1 : 2;
-      
-      
+
+      // Go back to find first potential payday before or at the start of the month
       while (isAfter(currentPayDate, currentMonthStart)) {
         currentPayDate = addWeeks(currentPayDate, -payIntervalWeeks);
       }
-      
+      // Then advance to the first payday on or after the month start
        while (isBefore(currentPayDate, currentMonthStart)) {
         currentPayDate = addWeeks(currentPayDate, payIntervalWeeks);
       }
-      
-      while (isBefore(currentPayDate, currentMonthEnd) || isEqual(currentPayDate, currentMonthEnd)) {
-         if (isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd})) {
-           calculatedMonthlyIncome += payPeriodConfig.payAmount;
+
+      while (isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd}) || isEqual(currentPayDate, currentMonthStart) || isEqual(currentPayDate, currentMonthEnd)) {
+         if(isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd})) {
+            calculatedMonthlyIncome += payPeriodConfig.payAmount;
          }
         currentPayDate = addWeeks(currentPayDate, payIntervalWeeks);
+        if(isAfter(currentPayDate, currentMonthEnd) && !isWithinInterval(currentPayDate, {start: currentMonthStart, end: currentMonthEnd})) break;
       }
     }
 
 
     let calculatedMonthlyBills = 0;
     bills.forEach(bill => {
-      if (bill.frequency === 'one-time') {
-        if (isWithinInterval(startOfDay(bill.nextDueDate), { start: currentMonthStart, end: currentMonthEnd })) {
-          calculatedMonthlyBills += bill.amount;
-        }
-      } else {
-        let currentBillDueDate = startOfDay(bill.nextDueDate);
-        
-        while (isBefore(currentBillDueDate, currentMonthStart)) {
-          currentBillDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
-        }
-        
-        while (isBefore(currentBillDueDate, currentMonthEnd) || isEqual(currentBillDueDate, currentMonthEnd)) {
-           if (isWithinInterval(currentBillDueDate, {start: currentMonthStart, end: currentMonthEnd})) { 
-             calculatedMonthlyBills += bill.amount;
-           }
-           currentBillDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
-           
-           if (isAfter(currentBillDueDate, currentMonthEnd) && bill.frequency !== 'one-time') break;
-        }
+      let currentBillDueDate = startOfDay(bill.nextDueDate);
+
+      if (bill.frequency !== 'one-time') {
+          while (isBefore(currentBillDueDate, currentMonthStart)) {
+            const advancedDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
+            if (isEqual(advancedDate, currentBillDueDate)) break;
+            currentBillDueDate = advancedDate;
+          }
+      }
+
+      while (!isAfter(currentBillDueDate, currentMonthEnd)) {
+         if (isWithinInterval(currentBillDueDate, {start: currentMonthStart, end: currentMonthEnd})) {
+           calculatedMonthlyBills += bill.amount;
+         }
+         if (bill.frequency === 'one-time') break;
+
+         const nextCalculatedDueDate = startOfDay(calculateNextOccurrence(currentBillDueDate, bill.frequency));
+         if (isEqual(nextCalculatedDueDate, currentBillDueDate)) {
+             break;
+         }
+         currentBillDueDate = nextCalculatedDueDate;
       }
     });
     setMonthlySummary({
@@ -303,7 +311,7 @@ export default function PocketWatchApp() {
       id: Date.now().toString(),
       name: data.name,
       amount: Number(data.amount) || 0,
-      nextDueDate: data.nextDueDate,
+      nextDueDate: startOfDay(data.nextDueDate), // Store original due date
       frequency: data.frequency,
     };
     setBills(prev => [...prev, newBill].sort((a,b) => a.nextDueDate.getTime() - b.nextDueDate.getTime()));
@@ -323,14 +331,14 @@ export default function PocketWatchApp() {
     }
     const newPayPeriodConfig: PayPeriodConfig = {
       payAmount: Number(data.payAmount) || 0,
-      lastPayday: data.lastPayday,
+      lastPayday: startOfDay(data.lastPayday),
       payFrequency: data.payFrequency,
     };
     setPayPeriodConfig(newPayPeriodConfig);
-    
+
     toast({ title: "Pay Period Updated", description: "Your pay period configuration has been saved." });
   };
-  
+
   if (isLoading) {
     return (
       <div className="flex justify-center items-center min-h-[calc(100vh-100px)]">
@@ -350,7 +358,36 @@ export default function PocketWatchApp() {
     }
   };
 
-  const displayedBillsDue = showAllDueBills ? billsDueThisPayPeriod : billsDueThisPayPeriod.slice(0, 3);
+  const getActualNextDueDate = (bill: Bill, today: Date): Date => {
+    if (bill.frequency === 'one-time') {
+      return bill.nextDueDate; // Return the stored due date for one-time bills
+    }
+
+    let actualNextDueDate = startOfDay(bill.nextDueDate); // Start with the bill's anchor/original due date
+    const todayStart = startOfDay(today);
+
+    // Advance the date until it's on or after today
+    while (isBefore(actualNextDueDate, todayStart)) {
+      const advancedDate = startOfDay(calculateNextOccurrence(actualNextDueDate, bill.frequency));
+      // Safety break if date doesn't advance (e.g., misconfigured or unexpected issue)
+      if (isEqual(advancedDate, actualNextDueDate)) {
+          break;
+      }
+      actualNextDueDate = advancedDate;
+    }
+    return actualNextDueDate;
+  };
+
+  const todayForBillDisplay = startOfDay(new Date());
+  const billsForDisplayInTable = bills
+    .map(bill => ({
+      ...bill,
+      actualDisplayDueDate: getActualNextDueDate(bill, todayForBillDisplay),
+    }))
+    .sort((a, b) => a.actualDisplayDueDate.getTime() - b.actualDisplayDueDate.getTime());
+
+
+  const displayedBillsDueInPayPeriod = showAllDueBills ? billsDueThisPayPeriod : billsDueThisPayPeriod.slice(0, 3);
 
   return (
     <div className="space-y-8 max-w-4xl mx-auto">
@@ -379,7 +416,7 @@ export default function PocketWatchApp() {
           </CardContent>
         </Card>
       )}
-      
+
       {payPeriodConfig && billsDueThisPayPeriod.length > 0 && currentPayPeriodDates && (
         <Card>
           <CardHeader>
@@ -389,7 +426,7 @@ export default function PocketWatchApp() {
             </CardDescription>
           </CardHeader>
           <CardContent>
-            {displayedBillsDue.length > 0 ? (
+            {displayedBillsDueInPayPeriod.length > 0 ? (
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -399,7 +436,7 @@ export default function PocketWatchApp() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {displayedBillsDue.map(bill => (
+                  {displayedBillsDueInPayPeriod.map(bill => (
                     <TableRow key={bill.id + bill.nextDueDate.toISOString()}>
                       <TableCell className="font-medium">{bill.name}</TableCell>
                       <TableCell>{format(bill.nextDueDate, 'MMM d, yyyy')}</TableCell>
@@ -424,7 +461,7 @@ export default function PocketWatchApp() {
           )}
         </Card>
       )}
-      
+
        {!payPeriodConfig && !isLoading && (
         <Alert>
           <Info className="h-4 w-4" />
@@ -470,7 +507,7 @@ export default function PocketWatchApp() {
       <Accordion type="single" collapsible className="w-full">
         <AccordionItem value="payPeriodConfigAccordionItem" className="border-b-0">
           <Card>
-            <AccordionTrigger className="px-6 text-left hover:no-underline">
+           <AccordionTrigger className="w-full px-6 text-left hover:no-underline">
               <CardHeader className="flex-1 p-0">
                 <CardTitle className="font-headline">Pay Period Configuration</CardTitle>
                 <CardDescription>Enter your pay amount, last payday, and how often you get paid.</CardDescription>
@@ -546,7 +583,7 @@ export default function PocketWatchApp() {
       <Card>
         <CardHeader>
           <CardTitle className="font-headline">Manage Bills</CardTitle>
-          <CardDescription>Add your recurring or one-time bills here. Bills are sorted by next due date.</CardDescription>
+          <CardDescription>Add your recurring or one-time bills here. Bills are sorted by their actual next due date.</CardDescription>
         </CardHeader>
         <CardContent className="space-y-6">
           <Accordion type="single" collapsible className="w-full">
@@ -585,7 +622,7 @@ export default function PocketWatchApp() {
                         name="nextDueDate"
                         render={({ field }) => (
                           <FormItem className="flex flex-col">
-                            <FormLabel>Next Due Date</FormLabel>
+                            <FormLabel>Next Due Date / Start Date</FormLabel>
                              <Popover>
                               <PopoverTrigger asChild>
                                 <FormControl>
@@ -631,7 +668,7 @@ export default function PocketWatchApp() {
             </AccordionItem>
           </Accordion>
 
-          {bills.length > 0 ? (
+          {billsForDisplayInTable.length > 0 ? (
             <div className="mt-6">
               <h3 className="text-lg font-medium mb-2">Your Bills</h3>
               <Table>
@@ -645,11 +682,11 @@ export default function PocketWatchApp() {
                   </TableRow>
                 </TableHeader>
                 <TableBody>
-                  {bills.map(bill => (
+                  {billsForDisplayInTable.map(bill => (
                     <TableRow key={bill.id}>
                       <TableCell className="font-medium">{bill.name}</TableCell>
                       <TableCell>{new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(bill.amount)}</TableCell>
-                      <TableCell>{format(bill.nextDueDate, 'MMM d, yyyy')}</TableCell>
+                      <TableCell>{format(bill.actualDisplayDueDate, 'MMM d, yyyy')}</TableCell>
                       <TableCell>{formatFrequency(bill.frequency)}</TableCell>
                       <TableCell className="text-right">
                         <Button variant="ghost" size="icon" onClick={() => handleDeleteBill(bill.id)} aria-label="Delete bill">
@@ -676,6 +713,4 @@ export default function PocketWatchApp() {
     </div>
   );
 }
-    
 
-    
