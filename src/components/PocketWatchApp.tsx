@@ -18,9 +18,9 @@ import {
   subWeeks,
   subMonths,
 } from 'date-fns';
-import { CalendarIcon, Loader2, PlusCircle, Trash2, Wallet, Info, ChevronDown, ChevronUp, Pencil } from 'lucide-react';
+import { CalendarIcon, Loader2, PlusCircle, Trash2, Wallet, Info, ChevronDown, ChevronUp, Pencil, Upload, Download } from 'lucide-react';
 import Image from 'next/image';
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 import { useForm, type SubmitHandler } from 'react-hook-form';
 import { z } from 'zod';
 
@@ -76,6 +76,7 @@ export default function PocketWatchApp() {
 
   const [editingBill, setEditingBill] = useState<Bill | null>(null);
   const [isBillFormDialogOpen, setIsBillFormDialogOpen] = useState(false);
+  const importFileInputRef = useRef<HTMLInputElement>(null);
 
 
   const billForm = useForm<BillFormData>({
@@ -491,6 +492,100 @@ export default function PocketWatchApp() {
     toast({ title: "Pay Period Updated", description: "Your pay period configuration has been saved." });
   };
 
+
+  const handleExportBills = () => {
+    if (bills.length === 0) {
+      toast({ title: "No Bills", description: "There are no bills to export.", variant: "default" });
+      return;
+    }
+    try {
+      const fileName = `pocket-watch-bills-${format(new Date(), 'yyyy-MM-dd')}.json`;
+      const jsonString = JSON.stringify(bills, null, 2); // null, 2 for pretty printing
+      const blob = new Blob([jsonString], { type: "application/json" });
+      const href = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = href;
+      link.download = fileName;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(href);
+      toast({ title: "Export Successful", description: "Your bills have been downloaded." });
+    } catch (error) {
+      console.error("Error exporting bills:", error);
+      toast({ title: "Export Error", description: "Could not export bills.", variant: "destructive" });
+    }
+  };
+
+  const handleImportClick = () => {
+    importFileInputRef.current?.click();
+  };
+
+  const processImportedFile = (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (!file) {
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const text = e.target?.result;
+        if (typeof text !== 'string') {
+          throw new Error("File content is not a string.");
+        }
+        const importedData = JSON.parse(text);
+
+        if (!Array.isArray(importedData)) {
+          throw new Error("Imported file is not a valid array of bills.");
+        }
+
+        const validatedBills: Bill[] = importedData.map((item: any, index: number) => {
+          if (typeof item.name !== 'string' ||
+              typeof item.amount !== 'number' ||
+              typeof item.nextDueDate !== 'string' ||
+              !['one-time', 'weekly', 'bi-weekly', 'tri-weekly', 'monthly'].includes(item.frequency)) {
+            throw new Error(`Bill at index ${index} has invalid structure or missing required fields.`);
+          }
+          const nextDueDate = startOfDay(new Date(item.nextDueDate));
+          if (isNaN(nextDueDate.getTime())) {
+            throw new Error(`Bill at index ${index} has an invalid nextDueDate.`);
+          }
+
+          return {
+            id: item.id || Date.now().toString() + index, // Ensure ID exists
+            name: item.name,
+            amount: Number(item.amount),
+            nextDueDate: nextDueDate,
+            frequency: item.frequency as BillFrequency,
+            isExistingRecurring: item.frequency !== 'one-time' && item.isExistingRecurring === undefined
+                                 ? true
+                                 : !!item.isExistingRecurring,
+          };
+        });
+
+        setBills(validatedBills.sort((a, b) => getActualNextDueDate(a, new Date()).getTime() - getActualNextDueDate(b, new Date()).getTime()));
+        toast({ title: "Import Successful", description: `${validatedBills.length} bills have been imported.` });
+      } catch (error: any) {
+        console.error("Error importing bills:", error);
+        toast({ title: "Import Failed", description: error.message || "Could not parse or validate the imported file.", variant: "destructive" });
+      } finally {
+        // Reset file input to allow importing the same file again if needed
+        if (event.target) {
+          event.target.value = "";
+        }
+      }
+    };
+    reader.onerror = () => {
+      toast({ title: "Import Failed", description: "Could not read the selected file.", variant: "destructive" });
+      if (event.target) {
+        event.target.value = "";
+      }
+    };
+    reader.readAsText(file);
+  };
+
+
   if (isLoading) {
     return (
       <div className="flex justify-center items-center min-h-[calc(100vh-100px)]">
@@ -720,7 +815,7 @@ export default function PocketWatchApp() {
                                         </Button>
                                         </FormControl>
                                     </PopoverTrigger>
-                                    <PopoverContent className="w-auto p-0" align="start">
+                                    <PopoverContent className="w-auto p-0" align="center">
                                         <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={(date) => date > new Date() || date < new Date("1900-01-01")} />
                                     </PopoverContent>
                                     </Popover>
@@ -757,12 +852,17 @@ export default function PocketWatchApp() {
       </Accordion>
 
       <Card>
-        <CardHeader className="flex flex-row justify-between items-center">
-            <div>
+        <CardHeader className="flex flex-col md:flex-row justify-between items-start md:items-center space-y-2 md:space-y-0">
+            <div className="flex-grow">
                 <CardTitle className="font-headline mb-2">Manage Bills</CardTitle>
                 <CardDescription>Add, edit, or remove your bills. Bills are sorted by their actual next due date.</CardDescription>
             </div>
-            <Button onClick={handleOpenAddBillDialog}><PlusCircle className="mr-2 h-4 w-4" /> Add New Bill</Button>
+            <div className="flex space-x-2 flex-shrink-0">
+                <input type="file" ref={importFileInputRef} onChange={processImportedFile} accept=".json" style={{ display: 'none' }} />
+                <Button variant="outline" onClick={handleImportClick}><Upload className="mr-2 h-4 w-4" /> Import Bills</Button>
+                <Button variant="outline" onClick={handleExportBills}><Download className="mr-2 h-4 w-4" /> Export Bills</Button>
+                <Button onClick={handleOpenAddBillDialog}><PlusCircle className="mr-2 h-4 w-4" /> Add New Bill</Button>
+            </div>
         </CardHeader>
         <CardContent className="space-y-6">
           {billsForDisplayInTable.length > 0 ? (
@@ -867,7 +967,7 @@ export default function PocketWatchApp() {
                                 </Button>
                                 </FormControl>
                             </PopoverTrigger>
-                            <PopoverContent className="w-auto p-0" align="start">
+                            <PopoverContent className="w-auto p-0" align="center">
                                 <Calendar mode="single" selected={field.value} onSelect={field.onChange} initialFocus disabled={(date) => date < startOfDay(new Date("1900-01-01"))} />
                             </PopoverContent>
                             </Popover>
